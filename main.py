@@ -23,7 +23,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-file", default=str(default_train))
     parser.add_argument("--use-tiny-train-file", action="store_true", help=f"Use {default_tiny} for faster smoke runs.")
     parser.add_argument("--max-seq-length", type=int, default=1024)
-    parser.add_argument("--max-train-steps", type=int, default=20)
+    parser.add_argument("--num-train-epochs", type=float, default=2.0)
+    parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=None,
+        help="Accelerate processes (typically GPUs) to use. Default: auto-detect all visible GPUs.",
+    )
+    parser.add_argument("--num-machines", type=int, default=1, help="Number of machines for Accelerate launch.")
     parser.add_argument("--output-root", default=str(repo_root / "results"))
     parser.add_argument("--run-id", default=None, help="Optional run id. If omitted, script uses current timestamp.")
     parser.add_argument("--wandb-mode", default="offline", choices=["offline", "online", "disabled"])
@@ -50,9 +57,12 @@ def main() -> int:
     env["TOKENIZER_NAME"] = args.tokenizer_name
     env["TRAIN_FILE"] = str(train_file)
     env["MAX_SEQ_LENGTH"] = str(args.max_seq_length)
-    env["MAX_TRAIN_STEPS"] = str(args.max_train_steps)
+    env["NUM_TRAIN_EPOCHS"] = str(args.num_train_epochs)
     env["OUTPUT_ROOT"] = args.output_root
     env["WANDB_MODE"] = args.wandb_mode
+    env["NUM_MACHINES"] = str(args.num_machines)
+    if args.num_processes is not None:
+        env["NUM_PROCESSES"] = str(args.num_processes)
     if args.run_id:
         env["RUN_ID"] = args.run_id
 
@@ -62,9 +72,11 @@ def main() -> int:
     print(f"TOKENIZER_NAME={env['TOKENIZER_NAME']}")
     print(f"TRAIN_FILE={env['TRAIN_FILE']}")
     print(f"MAX_SEQ_LENGTH={env['MAX_SEQ_LENGTH']}")
-    print(f"MAX_TRAIN_STEPS={env['MAX_TRAIN_STEPS']}")
+    print(f"NUM_TRAIN_EPOCHS={env['NUM_TRAIN_EPOCHS']}")
     print(f"OUTPUT_ROOT={env['OUTPUT_ROOT']}")
     print(f"WANDB_MODE={env['WANDB_MODE']}")
+    print(f"NUM_MACHINES={env['NUM_MACHINES']}")
+    print(f"NUM_PROCESSES={env.get('NUM_PROCESSES', 'auto')}")
 
     completed = subprocess.run(cmd, cwd=str(sft_root), env=env, check=False)
     return completed.returncode
