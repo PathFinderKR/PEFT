@@ -1,0 +1,17 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+results/
+
+# Large local data/cache artifacts
+sft-llm/.hf_cache/
+sft-llm/data/
+sft-llm/wandb/
+
+# Keep nested git backups local
+.repo_git_backup/
