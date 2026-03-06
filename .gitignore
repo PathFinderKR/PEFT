@@ -1,12 +1,17 @@
 # IDE
 .idea/
+.vscode/
 
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 
 # Runtime artifacts
 results/
+*.log
 
 # Large local data/cache artifacts
 sft-llm/.hf_cache/
@@ -15,3 +20,6 @@ sft-llm/wandb/
 
 # Keep nested git backups local
 .repo_git_backup/
+
+# OS
+.DS_Store
