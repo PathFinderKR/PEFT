@@ -84,11 +84,6 @@ probe_one() {
     --warmup_ratio 0.0 \
     --weight_decay 0.0 \
     --gradient_checkpointing \
-    --compute_hessian_effective_rank \
-    --hessian_top_n 2 \
-    --hessian_num_batches 1 \
-    --hessian_max_iter 3 \
-    --hessian_tol 1e-2 \
     --output_dir "${out_dir}" \
     --per_device_train_batch_size "${bs}" \
     --max_train_steps 1 \
@@ -101,8 +96,14 @@ probe_one() {
   if [[ ${rc} -ne 0 ]]; then
     return 1
   fi
-  if rg -qi "out of memory|CUDA out of memory|CUBLAS_STATUS_ALLOC_FAILED|RuntimeError: CUDA error" "${log_path}"; then
-    return 1
+  if command -v rg >/dev/null 2>&1; then
+    if rg -qi "out of memory|CUDA out of memory|CUBLAS_STATUS_ALLOC_FAILED|RuntimeError: CUDA error" "${log_path}"; then
+      return 1
+    fi
+  else
+    if grep -Eqi "out of memory|CUDA out of memory|CUBLAS_STATUS_ALLOC_FAILED|RuntimeError: CUDA error" "${log_path}"; then
+      return 1
+    fi
   fi
   return 0
 }
