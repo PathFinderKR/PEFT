@@ -162,6 +162,19 @@ PROBE_FATAL=0
 PROBE_FATAL_REASON=""
 FIND_MAX_BS_RESULT=0
 
+floor_pow2() {
+  local n="$1"
+  if [[ "${n}" -lt 1 ]]; then
+    echo 0
+    return
+  fi
+  local p=1
+  while [[ $((p * 2)) -le "${n}" ]]; do
+    p=$((p * 2))
+  done
+  echo "${p}"
+}
+
 probe_one() {
   local method="$1"
   local bs="$2"
@@ -263,7 +276,7 @@ find_max_bs() {
       right=$((mid - 1))
     fi
   done
-  FIND_MAX_BS_RESULT="${low}"
+  FIND_MAX_BS_RESULT="$(floor_pow2 "${low}")"
   return 0
 }
 
