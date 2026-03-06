@@ -6,6 +6,9 @@ TOKENIZER_NAME="${TOKENIZER_NAME:-meta-llama/Llama-3.2-1B}"
 TRAIN_FILE="${TRAIN_FILE:-data/processed/gpt4_alpaca/gpt4_alpaca_data.jsonl}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-1024}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-20}"
+FULL_BATCH_SIZE="${FULL_BATCH_SIZE:-16}"
+ADAPTER_BATCH_SIZE="${ADAPTER_BATCH_SIZE:-32}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 NUM_MACHINES="${NUM_MACHINES:-1}"
 NUM_PROCESSES="${NUM_PROCESSES:-auto}"
 MACHINE_RANK="${MACHINE_RANK:-0}"
@@ -16,7 +19,9 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/home/pathfinder/projects/PEFT/results}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 MODEL_KEY="${MODEL_KEY:-$(echo "${MODEL_NAME}" | tr '/:' '__')}"
 RUN_ROOT="${OUTPUT_ROOT}/${MODEL_KEY}/${RUN_ID}"
-export HF_HOME="${HF_HOME:-/home/pathfinder/projects/PEFT/sft-llm/.hf_cache}"
+export HF_HOME="${HF_HOME:-$(pwd)/.hf_cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_SILENT="${WANDB_SILENT:-true}"
 export PYTHONPATH="$(pwd)/peft/src${PYTHONPATH:+:${PYTHONPATH}}"
@@ -29,6 +34,7 @@ if [[ -n "${HUGGINGFACE_HUB_TOKEN:-}" && -z "${HF_TOKEN:-}" ]]; then
 fi
 
 mkdir -p "${RUN_ROOT}"/{checks,eval,hessian,training,tmp}
+mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}"
 echo "Run root: ${RUN_ROOT}"
 
 check_python_module() {
@@ -72,9 +78,20 @@ PY
   fi
 }
 
-if [[ "${NUM_PROCESSES}" == "auto" ]]; then
-  DETECTED_NUM_PROCESSES="$("${PYTHON_BIN}" - <<'PY'
-import sys
+if [[ ! "${FULL_BATCH_SIZE}" =~ ^[0-9]+$ || "${FULL_BATCH_SIZE}" -lt 1 ]]; then
+  echo "ERROR: FULL_BATCH_SIZE must be a positive integer. got=${FULL_BATCH_SIZE}" >&2
+  exit 1
+fi
+if [[ ! "${ADAPTER_BATCH_SIZE}" =~ ^[0-9]+$ || "${ADAPTER_BATCH_SIZE}" -lt 1 ]]; then
+  echo "ERROR: ADAPTER_BATCH_SIZE must be a positive integer. got=${ADAPTER_BATCH_SIZE}" >&2
+  exit 1
+fi
+if [[ ! "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ || "${GLOBAL_BATCH_SIZE}" -lt 1 ]]; then
+  echo "ERROR: GLOBAL_BATCH_SIZE must be a positive integer. got=${GLOBAL_BATCH_SIZE}" >&2
+  exit 1
+fi
+
+VISIBLE_CUDA_DEVICES="$("${PYTHON_BIN}" - <<'PY'
 try:
     import torch
     n = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -83,15 +100,20 @@ except Exception:
 print(n)
 PY
 )"
-  if [[ ! "${DETECTED_NUM_PROCESSES}" =~ ^[0-9]+$ ]]; then
-    DETECTED_NUM_PROCESSES=0
-  fi
-  if [[ "${DETECTED_NUM_PROCESSES}" -lt 1 ]]; then
-    echo "ERROR: NUM_PROCESSES=auto but no CUDA devices are visible to ${PYTHON_BIN}." >&2
-    echo "Check GPU passthrough and CUDA visibility (e.g. nvidia-smi, torch.cuda.device_count())." >&2
-    exit 1
-  fi
-  NUM_PROCESSES="${DETECTED_NUM_PROCESSES}"
+if [[ ! "${VISIBLE_CUDA_DEVICES}" =~ ^[0-9]+$ ]]; then
+  VISIBLE_CUDA_DEVICES=0
+fi
+
+if [[ "${NUM_PROCESSES}" == "auto" ]]; then
+  NUM_PROCESSES="${VISIBLE_CUDA_DEVICES}"
+fi
+if [[ ! "${NUM_PROCESSES}" =~ ^[0-9]+$ || "${NUM_PROCESSES}" -lt 1 ]]; then
+  echo "ERROR: NUM_PROCESSES must be a positive integer or 'auto'. got=${NUM_PROCESSES}" >&2
+  exit 1
+fi
+if [[ "${VISIBLE_CUDA_DEVICES}" -lt "${NUM_PROCESSES}" ]]; then
+  echo "ERROR: Need at least ${NUM_PROCESSES} visible CUDA devices, but found ${VISIBLE_CUDA_DEVICES}." >&2
+  exit 1
 fi
 
 missing_modules=()
@@ -119,6 +141,7 @@ accelerate_cmd=(
   finetune/finetune.py
 )
 echo "Accelerate launch: num_machines=${NUM_MACHINES} num_processes=${NUM_PROCESSES} machine_rank=${MACHINE_RANK} main_process_ip=${MAIN_PROCESS_IP} main_process_port=${MAIN_PROCESS_PORT}"
+echo "Batch config target: global=${GLOBAL_BATCH_SIZE} | full(per_device=${FULL_BATCH_SIZE}) | lora/sft(per_device=${ADAPTER_BATCH_SIZE})"
 
 base_train_args=(
   --model_name_or_path "${MODEL_NAME}"
@@ -126,7 +149,6 @@ base_train_args=(
   --train_file "${TRAIN_FILE}"
   --max_seq_length "${MAX_SEQ_LENGTH}"
   --preprocessing_num_workers 1
-  --gradient_accumulation_steps 1
   --learning_rate 1e-5
   --lr_scheduler_type linear
   --warmup_ratio 0.0
@@ -283,6 +305,7 @@ find_max_bs() {
 run_train() {
   local method="$1"
   local bs="$2"
+  local ga="$3"
   local out_dir="${RUN_ROOT}/training/${method}"
   local log_path="${RUN_ROOT}/checks/train_${method}.log"
   local extra
@@ -293,6 +316,7 @@ run_train() {
     "${base_train_args[@]}" \
     --output_dir "${out_dir}" \
     --per_device_train_batch_size "${bs}" \
+    --gradient_accumulation_steps "${ga}" \
     --wandb_run_name "train-${method}-${RUN_ID}" \
     ${extra} \
     > "${log_path}" 2>&1
@@ -393,23 +417,23 @@ else
 fi
 
 declare -A MAX_BS
+declare -A GRAD_ACCUM
+MAX_BS["full"]="${FULL_BATCH_SIZE}"
+MAX_BS["lora"]="${ADAPTER_BATCH_SIZE}"
+MAX_BS["sft"]="${ADAPTER_BATCH_SIZE}"
+
 for m in full lora sft; do
-  echo "Probing max batch size for ${m} ..."
-  if ! find_max_bs "${m}"; then
-    probe_rc=$?
-    if [[ ${probe_rc} -eq 2 || ${PROBE_FATAL} -eq 1 ]]; then
-      echo "ERROR: ${PROBE_FATAL_REASON}" | tee -a "${RUN_ROOT}/checks/failed_methods.txt" >&2
-      exit 1
-    fi
-    echo "ERROR: Probe failed for unknown reason (method=${m})" | tee -a "${RUN_ROOT}/checks/failed_methods.txt" >&2
+  denom=$((NUM_PROCESSES * MAX_BS[$m]))
+  if (( GLOBAL_BATCH_SIZE % denom != 0 )); then
+    echo "ERROR: GLOBAL_BATCH_SIZE (${GLOBAL_BATCH_SIZE}) must be divisible by num_processes*per_device for ${m} (${NUM_PROCESSES}*${MAX_BS[$m]}=${denom})." >&2
     exit 1
   fi
-  if [[ ${PROBE_FATAL} -eq 1 ]]; then
-    echo "ERROR: ${PROBE_FATAL_REASON}" | tee -a "${RUN_ROOT}/checks/failed_methods.txt" >&2
+  GRAD_ACCUM["${m}"]=$((GLOBAL_BATCH_SIZE / denom))
+  if [[ "${GRAD_ACCUM[$m]}" -lt 1 ]]; then
+    echo "ERROR: Invalid gradient_accumulation_steps for ${m}: ${GRAD_ACCUM[$m]}" >&2
     exit 1
   fi
-  MAX_BS["${m}"]="${FIND_MAX_BS_RESULT}"
-  echo "${m}=${MAX_BS[$m]}" | tee -a "${RUN_ROOT}/checks/max_batch_sizes.txt"
+  echo "${m}=${MAX_BS[$m]} (grad_accum=${GRAD_ACCUM[$m]}, global=${GLOBAL_BATCH_SIZE})" | tee -a "${RUN_ROOT}/checks/max_batch_sizes.txt"
 done
 
 for m in full lora sft; do
@@ -417,8 +441,8 @@ for m in full lora sft; do
     echo "Skipping ${m}: no feasible batch size found" | tee -a "${RUN_ROOT}/checks/failed_methods.txt"
     continue
   fi
-  echo "Training ${m} with bs=${MAX_BS[$m]} ..."
-  run_train "${m}" "${MAX_BS[$m]}"
+  echo "Training ${m} with bs=${MAX_BS[$m]} grad_accum=${GRAD_ACCUM[$m]} (global=${GLOBAL_BATCH_SIZE}) ..."
+  run_train "${m}" "${MAX_BS[$m]}" "${GRAD_ACCUM[$m]}"
   echo "Hessian landscape ${m} ..."
   run_landscape "${m}"
   echo "Eval ${m} ..."
