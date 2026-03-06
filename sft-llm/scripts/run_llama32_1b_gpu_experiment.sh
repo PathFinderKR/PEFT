@@ -6,6 +6,12 @@ TOKENIZER_NAME="${TOKENIZER_NAME:-meta-llama/Llama-3.2-1B}"
 TRAIN_FILE="${TRAIN_FILE:-data/processed/gpt4_alpaca/gpt4_alpaca_data.jsonl}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-1024}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-20}"
+NUM_MACHINES="${NUM_MACHINES:-1}"
+NUM_PROCESSES="${NUM_PROCESSES:-auto}"
+MACHINE_RANK="${MACHINE_RANK:-0}"
+MAIN_PROCESS_IP="${MAIN_PROCESS_IP:-127.0.0.1}"
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29500}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/pathfinder/projects/PEFT/results}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 MODEL_KEY="${MODEL_KEY:-$(echo "${MODEL_NAME}" | tr '/:' '__')}"
@@ -13,15 +19,106 @@ RUN_ROOT="${OUTPUT_ROOT}/${MODEL_KEY}/${RUN_ID}"
 export HF_HOME="${HF_HOME:-/home/pathfinder/projects/PEFT/sft-llm/.hf_cache}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_SILENT="${WANDB_SILENT:-true}"
-if [[ -f /home/pathfinder/.cache/huggingface/token ]]; then
-  export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-$(cat /home/pathfinder/.cache/huggingface/token)}"
-  export HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN}}"
+export PYTHONPATH="$(pwd)/peft/src${PYTHONPATH:+:${PYTHONPATH}}"
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-${HOME}/.cache/huggingface/token}"
+if [[ -z "${HUGGINGFACE_HUB_TOKEN:-}" && -f "${HF_TOKEN_FILE}" ]]; then
+  export HUGGINGFACE_HUB_TOKEN="$(cat "${HF_TOKEN_FILE}")"
+fi
+if [[ -n "${HUGGINGFACE_HUB_TOKEN:-}" && -z "${HF_TOKEN:-}" ]]; then
+  export HF_TOKEN="${HUGGINGFACE_HUB_TOKEN}"
 fi
 
 mkdir -p "${RUN_ROOT}"/{checks,eval,hessian,training,tmp}
 echo "Run root: ${RUN_ROOT}"
 
-accelerate_cmd=(accelerate launch --num_machines 1 --num_processes 1 finetune/finetune.py)
+check_python_module() {
+  local module="$1"
+  "${PYTHON_BIN}" -c "import ${module}" >/dev/null 2>&1
+}
+
+check_model_access() {
+  if [[ -d "${MODEL_NAME}" || -f "${MODEL_NAME}" ]]; then
+    return 0
+  fi
+  local access_log="${RUN_ROOT}/checks/model_access.log"
+  set +e
+  "${PYTHON_BIN}" - <<'PY' > "${access_log}" 2>&1
+import os
+import sys
+
+from transformers import AutoConfig
+
+model_name = os.environ["MODEL_NAME"]
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+try:
+    AutoConfig.from_pretrained(model_name, token=token)
+except Exception as exc:
+    print(f"MODEL_ACCESS_CHECK_FAILED: {exc}")
+    raise
+print("MODEL_ACCESS_CHECK_OK")
+PY
+  local rc=$?
+  set -e
+  if [[ ${rc} -ne 0 ]]; then
+    echo "ERROR: Cannot load model config for MODEL_NAME=${MODEL_NAME}." >&2
+    if command -v rg >/dev/null 2>&1; then
+      if rg -qi "gated repo|401|unauthorized|access.*restricted|please log in" "${access_log}"; then
+        echo "Hint: ${MODEL_NAME} is gated or requires authentication." >&2
+        echo "Request access on Hugging Face and set HF_TOKEN (or run huggingface-cli login)." >&2
+      fi
+    fi
+    echo "Details: ${access_log}" >&2
+    return 1
+  fi
+}
+
+if [[ "${NUM_PROCESSES}" == "auto" ]]; then
+  DETECTED_NUM_PROCESSES="$("${PYTHON_BIN}" - <<'PY'
+import sys
+try:
+    import torch
+    n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+except Exception:
+    n = 0
+print(n)
+PY
+)"
+  if [[ ! "${DETECTED_NUM_PROCESSES}" =~ ^[0-9]+$ ]]; then
+    DETECTED_NUM_PROCESSES=0
+  fi
+  if [[ "${DETECTED_NUM_PROCESSES}" -lt 1 ]]; then
+    echo "ERROR: NUM_PROCESSES=auto but no CUDA devices are visible to ${PYTHON_BIN}." >&2
+    echo "Check GPU passthrough and CUDA visibility (e.g. nvidia-smi, torch.cuda.device_count())." >&2
+    exit 1
+  fi
+  NUM_PROCESSES="${DETECTED_NUM_PROCESSES}"
+fi
+
+missing_modules=()
+for mod in accelerate transformers datasets peft; do
+  if ! check_python_module "${mod}"; then
+    missing_modules+=("${mod}")
+  fi
+done
+if [[ ${#missing_modules[@]} -gt 0 ]]; then
+  echo "ERROR: Missing Python modules in ${PYTHON_BIN}: ${missing_modules[*]}" >&2
+  echo "Install dependencies first (example):" >&2
+  echo "  ${PYTHON_BIN} -m pip install -r requirements.txt" >&2
+  exit 1
+fi
+
+check_model_access
+
+accelerate_cmd=(
+  "${PYTHON_BIN}" -m accelerate.commands.launch
+  --num_machines "${NUM_MACHINES}"
+  --num_processes "${NUM_PROCESSES}"
+  --machine_rank "${MACHINE_RANK}"
+  --main_process_ip "${MAIN_PROCESS_IP}"
+  --main_process_port "${MAIN_PROCESS_PORT}"
+  finetune/finetune.py
+)
+echo "Accelerate launch: num_machines=${NUM_MACHINES} num_processes=${NUM_PROCESSES} machine_rank=${MACHINE_RANK} main_process_ip=${MAIN_PROCESS_IP} main_process_port=${MAIN_PROCESS_PORT}"
 
 base_train_args=(
   --model_name_or_path "${MODEL_NAME}"
@@ -61,6 +158,10 @@ method_args() {
   fi
 }
 
+PROBE_FATAL=0
+PROBE_FATAL_REASON=""
+FIND_MAX_BS_RESULT=0
+
 probe_one() {
   local method="$1"
   local bs="$2"
@@ -94,7 +195,25 @@ probe_one() {
   set -e
 
   if [[ ${rc} -ne 0 ]]; then
-    return 1
+    if command -v rg >/dev/null 2>&1; then
+      if rg -qi "gated repo|401|unauthorized|access.*restricted|please log in|hf_raise_for_status|GatedRepoError" "${log_path}"; then
+        PROBE_FATAL=1
+        PROBE_FATAL_REASON="Model access/auth failure for method=${method}. Check Hugging Face token/permissions. See ${log_path}"
+        return 2
+      fi
+    fi
+    if command -v rg >/dev/null 2>&1; then
+      if rg -qi "out of memory|CUDA out of memory|CUBLAS_STATUS_ALLOC_FAILED|RuntimeError: CUDA error" "${log_path}"; then
+        return 1
+      fi
+    else
+      if grep -Eqi "out of memory|CUDA out of memory|CUBLAS_STATUS_ALLOC_FAILED|RuntimeError: CUDA error" "${log_path}"; then
+        return 1
+      fi
+    fi
+    PROBE_FATAL=1
+    PROBE_FATAL_REASON="Non-OOM probe failure for method=${method}, bs=${bs}. See ${log_path}"
+    return 2
   fi
   if command -v rg >/dev/null 2>&1; then
     if rg -qi "out of memory|CUDA out of memory|CUBLAS_STATUS_ALLOC_FAILED|RuntimeError: CUDA error" "${log_path}"; then
@@ -118,12 +237,16 @@ find_max_bs() {
       low=${high}
       high=$((high * 2))
     else
+      local rc=$?
+      if [[ ${rc} -eq 2 ]]; then
+        return 2
+      fi
       break
     fi
   done
   if [[ ${low} -eq 0 ]]; then
-    echo 0
-    return
+    FIND_MAX_BS_RESULT=0
+    return 0
   fi
   local left=$((low + 1))
   local right=$((high - 1))
@@ -133,10 +256,15 @@ find_max_bs() {
       low=${mid}
       left=$((mid + 1))
     else
+      local rc=$?
+      if [[ ${rc} -eq 2 ]]; then
+        return 2
+      fi
       right=$((mid - 1))
     fi
   done
-  echo "${low}"
+  FIND_MAX_BS_RESULT="${low}"
+  return 0
 }
 
 run_train() {
@@ -172,7 +300,7 @@ run_landscape() {
     adapter_arg=(--adapter_path "${RUN_ROOT}/training/${method}")
   fi
 
-  python scripts/plot_hessian_landscape_3d.py \
+  "${PYTHON_BIN}" scripts/plot_hessian_landscape_3d.py \
     --model_name_or_path "${MODEL_NAME}" \
     --tokenizer_name "${TOKENIZER_NAME}" \
     "${adapter_arg[@]}" \
@@ -200,7 +328,7 @@ run_eval_suite() {
   fi
   mkdir -p "${eval_root}"
 
-  python -m eval.gsm.run_eval \
+  "${PYTHON_BIN}" -m eval.gsm.run_eval \
     --data_dir data/eval/gsm \
     --max_num_examples 64 \
     --save_dir "${eval_root}/gsm" \
@@ -210,7 +338,7 @@ run_eval_suite() {
     --eval_batch_size 1 \
     > "${RUN_ROOT}/checks/eval_gsm_${method}.log" 2>&1
 
-  python -m eval.mmlu.run_eval \
+  "${PYTHON_BIN}" -m eval.mmlu.run_eval \
     --data_dir data/eval/mmlu \
     --save_dir "${eval_root}/mmlu" \
     --model_name_or_path "${MODEL_NAME}" \
@@ -222,7 +350,7 @@ run_eval_suite() {
     --eval_batch_size 1 \
     > "${RUN_ROOT}/checks/eval_mmlu_${method}.log" 2>&1
 
-  python -m eval.bbh.run_eval \
+  "${PYTHON_BIN}" -m eval.bbh.run_eval \
     --data_dir data/eval/bbh \
     --save_dir "${eval_root}/bbh" \
     --model_name_or_path "${MODEL_NAME}" \
@@ -232,7 +360,7 @@ run_eval_suite() {
     --eval_batch_size 1 \
     > "${RUN_ROOT}/checks/eval_bbh_${method}.log" 2>&1
 
-  python -m eval.tydiqa.run_eval \
+  "${PYTHON_BIN}" -m eval.tydiqa.run_eval \
     --data_dir data/eval/tydiqa \
     --save_dir "${eval_root}/tydiqa" \
     --model_name_or_path "${MODEL_NAME}" \
@@ -254,7 +382,20 @@ fi
 declare -A MAX_BS
 for m in full lora sft; do
   echo "Probing max batch size for ${m} ..."
-  MAX_BS["${m}"]="$(find_max_bs "${m}")"
+  if ! find_max_bs "${m}"; then
+    probe_rc=$?
+    if [[ ${probe_rc} -eq 2 || ${PROBE_FATAL} -eq 1 ]]; then
+      echo "ERROR: ${PROBE_FATAL_REASON}" | tee -a "${RUN_ROOT}/checks/failed_methods.txt" >&2
+      exit 1
+    fi
+    echo "ERROR: Probe failed for unknown reason (method=${m})" | tee -a "${RUN_ROOT}/checks/failed_methods.txt" >&2
+    exit 1
+  fi
+  if [[ ${PROBE_FATAL} -eq 1 ]]; then
+    echo "ERROR: ${PROBE_FATAL_REASON}" | tee -a "${RUN_ROOT}/checks/failed_methods.txt" >&2
+    exit 1
+  fi
+  MAX_BS["${m}"]="${FIND_MAX_BS_RESULT}"
   echo "${m}=${MAX_BS[$m]}" | tee -a "${RUN_ROOT}/checks/max_batch_sizes.txt"
 done
 
@@ -271,7 +412,7 @@ for m in full lora sft; do
   run_eval_suite "${m}"
 done
 
-python - <<PY
+"${PYTHON_BIN}" - <<PY
 import json, os
 run_root = "${RUN_ROOT}"
 summary = {"run_root": run_root, "methods": {}}
